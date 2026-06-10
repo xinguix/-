@@ -1,31 +1,54 @@
 """
 天气查询智能体
-基于 Langchain + 通义千问，使用高德地图天气API
+基于 LangChain + 通义千问，使用高德地图天气API
 """
 
 import os
+from typing import Any
+
 import requests
 from dotenv import load_dotenv
-from langchain_openai import ChatOpenAI
-from langchain.agents import create_tool_calling_agent
-from langchain.agents import AgentExecutor
-from langchain_core.tools import tool
+from langchain.agents.agent import AgentExecutor
+from langchain.agents.openai_tools.base import create_openai_tools_agent
 from langchain_core.prompts import ChatPromptTemplate, MessagesPlaceholder
+from langchain_core.tools import tool
+from langchain_openai import ChatOpenAI
 from pydantic import BaseModel, Field
 
+# ============================================================
+# 通用工具函数
+# ============================================================
 
-#2.加载环境变量并检验
+
+def safe_encode(text: str) -> str:
+    """安全编码，处理 Windows GBK 等非 UTF-8 终端环境"""
+    return text.encode("utf-8", "replace").decode("utf-8")
+
+
+def _validate_amap_response(data: dict[str, Any], city: str) -> str | None:
+    """验证高德天气 API 返回数据，成功返回 None，失败返回错误信息"""
+    if data.get("status") != "1" or data.get("infocode") != "10000":
+        return f"城市'{city}'查询失败，请检查城市名称是否正确。"
+    return None
+
+
+# ============================================================
+# 加载环境变量并校验
+# ============================================================
+
 load_dotenv()
-DASHSCOPE_API_KEY = os.getenv("DASHSCOPE_API_KEY")  #通义千问的API KEY
-AMAP_API_KEY = os.getenv("AMAP_API_KEY")   #高德地图的API KEY
+DASHSCOPE_API_KEY = os.getenv("DASHSCOPE_API_KEY")  # 通义千问 API KEY
+AMAP_API_KEY = os.getenv("AMAP_API_KEY")  # 高德地图 API KEY
+
 if not DASHSCOPE_API_KEY:
-    raise ValueError("请在 .env文件中配置 DASHSCOPE_API_KEY")
+    raise ValueError("请在 .env 文件中配置 DASHSCOPE_API_KEY")
 if not AMAP_API_KEY:
-    raise ValueError("请在 .env文件中配置AMAP_API_KEY")
+    raise ValueError("请在 .env 文件中配置 AMAP_API_KEY")
 
+# ============================================================
+# 初始化通义千问大模型
+# ============================================================
 
-
-#初始化通义千问大模型
 llm = ChatOpenAI(
     model="qwen-plus",
     api_key=DASHSCOPE_API_KEY,
@@ -33,10 +56,14 @@ llm = ChatOpenAI(
     temperature=0.7,
 )
 
+# ============================================================
+# 定义工具：实时天气查询
+# ============================================================
 
-#4.定义工具
+
 class WeatherInput(BaseModel):
-    city: str = Field(description="城市名称，例如'北京'，'上海','广州'")
+    city: str = Field(description="城市名称，例如'北京'，'上海'，'广州'")
+
 
 @tool(args_schema=WeatherInput)
 def get_weather(city: str) -> str:
@@ -46,57 +73,65 @@ def get_weather(city: str) -> str:
     """
     base_url = "https://restapi.amap.com/v3/weather/weatherInfo"
     params = {
-    "key": AMAP_API_KEY,
-    "city": city,
-    "extensions": "base",
+        "key": AMAP_API_KEY,
+        "city": city,
+        "extensions": "base",
     }
 
     try:
-        response = requests.get(base_url,params=params, timeout=10)
+        response = requests.get(base_url, params=params, timeout=10)
         data = response.json()
-        if data.get("status") !="1" or data.get("infocode")!="10000":
-            return f"城市'{city}' 查询失败，请检查城市名称是否正确。"
-        lives = data.get("lives",[])
-        if not lives:
-            return f"未找到城市'{city}'的天气信息。"
-        weather_info = lives[0]
-        province = weather_info.get("province","")
-        city_name = weather_info.get("city",city)
-        weather = weather_info.get("weather","")
-        temperature = weather_info.get("temperature","")
-        winddirection = weather_info.get("winddirection","")
-        windpower = weather_info.get("windpower", "")
-        humidity = weather_info.get("humidity","")
-
-        result = (
-            f"📍 {province}{city_name}\n"
-            f"🌤️ 天气：{weather}\n"
-            f"🌡️ 温度：{temperature}℃\n"
-            f"💨 风向：{winddirection}\n"
-            f"🍃 风力：{windpower}级\n"
-            f"💧 湿度：{humidity}%"
-        )
-        # 处理编码问题
-        result = result.encode('utf-8', 'replace').decode('utf-8')
-        return result
+    except requests.Timeout:
+        return "天气服务响应超时，请稍后重试。"
     except requests.RequestException as e:
-        return f"天气服务连接失败: {str(e)}"
+        return f"天气服务连接失败，请检查网络: {e}"
     except Exception as e:
-        return f"查询天气时出错: {str(e)}"
+        return f"解析天气数据时出错: {e}"
+
+    error = _validate_amap_response(data, city)
+    if error:
+        return error
+
+    lives = data.get("lives", [])
+    if not lives:
+        return f"未找到城市'{city}'的天气信息。"
+
+    weather_info = lives[0]
+    province = weather_info.get("province", "")
+    city_name = weather_info.get("city", city)
+    weather = weather_info.get("weather", "")
+    temperature = weather_info.get("temperature", "")
+    winddirection = weather_info.get("winddirection", "")
+    windpower = weather_info.get("windpower", "")
+    humidity = weather_info.get("humidity", "")
+
+    result = (
+        f"📍 {province}{city_name}\n"
+        f"🌤️ 天气：{weather}\n"
+        f"🌡️ 温度：{temperature}℃\n"
+        f"💨 风向：{winddirection}\n"
+        f"🍃 风力：{windpower}级\n"
+        f"💧 湿度：{humidity}%"
+    )
+    return safe_encode(result)
 
 
+# ============================================================
+# 定义工具：多日天气预报
+# ============================================================
 
-#5.定义工具2：多日天气预报（进阶功能）
+
 class ForecastInput(BaseModel):
     """多日天气预报的参数结构"""
+
     city: str = Field(description="城市名称，例如'北京'，'上海'，'广州'")
 
 
 @tool(args_schema=ForecastInput)
 def get_weather_forecast(city: str) -> str:
     """
-    获取制定城市未来3-4天的天气预报。
-    包含了每日的天气状况、最高/最低温度、风力风向等
+    获取指定城市未来3-4天的天气预报。
+    包含每日的天气状况、最高/最低温度、风力风向等
     """
     base_url = "https://restapi.amap.com/v3/weather/weatherInfo"
     params = {
@@ -106,47 +141,55 @@ def get_weather_forecast(city: str) -> str:
     }
 
     try:
-        response = requests.get(base_url,params=params, timeout=10)
+        response = requests.get(base_url, params=params, timeout=10)
         data = response.json()
-
-        if data.get("status")!="1" or data.get("infocode") != "10000":
-            return f"城市'{city}'查询失败。"
-        forecasts = data.get("forecasts",[])
-        if not forecasts:
-            return f"未找到城市'{city}' 的预报信息。"
-        forecast_data = forecasts[0]
-        city_name = forecast_data.get("city",city)
-        casts = forecast_data.get("casts",[])
-        if not casts:
-            return f"未找到城市'{city_name}'的天气预报"
-        result_lines = [f"{city_name}未来天气预报"]
-        for cast in casts[:4]:
-            date = cast.get("date","")
-            day_weather = cast.get("dayweather","")
-            night_weather = cast.get("nightweather","")
-            day_temp = cast.get("daytemp","")
-            night_temp = cast.get("nighttemp","")
-            week = cast.get("week","")
-
-            line = (
-                f"\n📆 {date} 周{week}\n"
-                f"   日间：{day_weather}，{day_temp}℃\n"
-                f"   夜间：{night_weather}，{night_temp}℃"
-            )
-            result_lines.append(line)
-
-        result = "\n".join(result_lines)
-        # 处理编码问题
-        result = result.encode('utf-8', 'replace').decode('utf-8')
-        return result
+    except requests.Timeout:
+        return "天气服务响应超时，请稍后重试。"
     except requests.RequestException as e:
-        return f"天气服务连接失败：{str(e)}"
+        return f"天气服务连接失败，请检查网络: {e}"
     except Exception as e:
-        return f"查询预报时出错：{str(e)}"
+        return f"解析预报数据时出错: {e}"
+
+    error = _validate_amap_response(data, city)
+    if error:
+        return error
+
+    forecasts = data.get("forecasts", [])
+    if not forecasts:
+        return f"未找到城市'{city}'的预报信息。"
+
+    forecast_data = forecasts[0]
+    city_name = forecast_data.get("city", city)
+    casts = forecast_data.get("casts", [])
+    if not casts:
+        return f"未找到城市'{city_name}'的天气预报。"
+
+    result_lines = [f"{city_name}未来天气预报"]
+    for cast in casts[:4]:
+        date = cast.get("date", "")
+        day_weather = cast.get("dayweather", "")
+        night_weather = cast.get("nightweather", "")
+        day_temp = cast.get("daytemp", "")
+        night_temp = cast.get("nighttemp", "")
+        week = cast.get("week", "")
+
+        line = (
+            f"\n📆 {date} 周{week}\n"
+            f"   日间：{day_weather}，{day_temp}℃\n"
+            f"   夜间：{night_weather}，{night_temp}℃"
+        )
+        result_lines.append(line)
+
+    result = "\n".join(result_lines)
+    return safe_encode(result)
 
 
-#6.创建智能体
+# ============================================================
+# 创建智能体
+# ============================================================
+
 tools = [get_weather, get_weather_forecast]
+
 system_prompt = """
 你是一个专业友好的天气助手，可以根据用户需求提供准确的天气信息。
 
@@ -157,7 +200,7 @@ system_prompt = """
 理解用户意图的指南：
 
 【实时天气查询的常见表达方式】
-- 中文：今天天气怎么样？、现在天气如何？、当前温度多少？、今天冷不冷？、外面下雨吗？、空气质量怎么样？
+- 中文：今天天气怎么样？、现在天气如何？、当前温度多少？、今天冷不冷？、外面下雨吗？
 - 英文：What's the weather today?、Current weather、Today's temperature、Is it raining?、How's the weather?
 
 【天气预报查询的常见表达方式】
@@ -187,7 +230,7 @@ prompt = ChatPromptTemplate.from_messages([
     ("assistant", "{agent_scratchpad}"),
 ])
 
-agent = create_tool_calling_agent(
+agent = create_openai_tools_agent(
     llm=llm,
     tools=tools,
     prompt=prompt,
@@ -200,41 +243,53 @@ agent_executor = AgentExecutor(
 )
 
 
+def get_agent_executor() -> AgentExecutor:
+    """返回已初始化的 agent_executor 实例（懒加载工厂函数）"""
+    return agent_executor
 
-def main():
+
+# ============================================================
+# 终端命令行入口
+# ============================================================
+
+
+def main() -> None:
     """启动天气查询智能体，在终端进行交互式对话"""
-    print("=" * 50)
-    print("🤖 天气查询智能体已启动")
-    print("=" * 50)
-    print("支持查询：实时天气 / 未来天气预报")
-    print("输入 'exit' 或 'quit' 退出\n")
+    safe_print("=" * 50)
+    safe_print("[Bot] 天气查询智能体已启动")
+    safe_print("=" * 50)
+    safe_print("支持查询：实时天气 / 未来天气预报")
+    safe_print("输入 'exit' 或 'quit' 退出\n")
 
     while True:
-        user_input = input("👤 你: ").strip()
+        try:
+            user_input = input("[You]: ").strip()
+        except UnicodeEncodeError:
+            user_input = input("You: ").strip()
+
         # 退出条件
         if user_input.lower() in ["exit", "quit"]:
-            print("👋 再见！")
+            safe_print("[Bye] 再见！")
             break
         if not user_input:
             continue
 
         try:
-            # 调用 Agent 处理用户输入
-            # agent.invoke 接收一个包含 messages 的字典，消息格式为 LangChain 标准格式
-            result = agent_executor.invoke({
-                "input": user_input
-            })
-            # 从返回结果中提取 AI 的回复内容
+            result = agent_executor.invoke({"input": user_input})
             answer = result["output"]
-            # 处理编码问题
-            answer = answer.encode('utf-8', 'replace').decode('utf-8')
-            print(f"🤖 助手:\n{answer}\n")
+            answer = safe_encode(answer)
+            safe_print(f"[Bot]:\n{answer}\n")
         except Exception as e:
-            print(f"❌ 出错了: {e}\n")
+            safe_print(f"[Error] 出错了: {e}\n")
 
 
-# ============================================================
-# 脚本入口
-# ============================================================
+def safe_print(text: str) -> None:
+    """安全打印，处理 Windows GBK 编码问题"""
+    try:
+        print(text)
+    except UnicodeEncodeError:
+        print(safe_encode(text))
+
+
 if __name__ == "__main__":
     main()
