@@ -7,8 +7,10 @@ import os
 import requests
 from dotenv import load_dotenv
 from langchain_openai import ChatOpenAI
-from langchain.agents import create_agent
+from langchain.agents import create_tool_calling_agent
+from langchain.agents import AgentExecutor
 from langchain_core.tools import tool
+from langchain_core.prompts import ChatPromptTemplate, MessagesPlaceholder
 from pydantic import BaseModel, Field
 
 
@@ -74,6 +76,8 @@ def get_weather(city: str) -> str:
             f"🍃 风力：{windpower}级\n"
             f"💧 湿度：{humidity}%"
         )
+        # 处理编码问题
+        result = result.encode('utf-8', 'replace').decode('utf-8')
         return result
     except requests.RequestException as e:
         return f"天气服务连接失败: {str(e)}"
@@ -131,7 +135,10 @@ def get_weather_forecast(city: str) -> str:
             )
             result_lines.append(line)
 
-        return "\n".join(result_lines)
+        result = "\n".join(result_lines)
+        # 处理编码问题
+        result = result.encode('utf-8', 'replace').decode('utf-8')
+        return result
     except requests.RequestException as e:
         return f"天气服务连接失败：{str(e)}"
     except Exception as e:
@@ -140,25 +147,56 @@ def get_weather_forecast(city: str) -> str:
 
 #6.创建智能体
 tools = [get_weather, get_weather_forecast]
-system_prompt = ("""
-你是一个专业友好的天气助手，可以根据用户需求提供准确得天气信息。
+system_prompt = """
+你是一个专业友好的天气助手，可以根据用户需求提供准确的天气信息。
 
 你可以使用以下工具:
-1.getweather: 查询指定城市的实时天气
-2.getweather_forecast:查询指定城市的未来天气预报
+1. get_weather: 查询指定城市的实时天气（包括当前温度、天气状况、湿度、风向风力等）
+2. get_weather_forecast: 查询指定城市的未来3-4天天气预报
+
+理解用户意图的指南：
+
+【实时天气查询的常见表达方式】
+- 中文：今天天气怎么样？、现在天气如何？、当前温度多少？、今天冷不冷？、外面下雨吗？、空气质量怎么样？
+- 英文：What's the weather today?、Current weather、Today's temperature、Is it raining?、How's the weather?
+
+【天气预报查询的常见表达方式】
+- 中文：未来几天天气、天气预报、这周天气怎么样？、明天天气、后天天气、周末天气
+- 英文：Weather forecast、Forecast for next few days、Tomorrow's weather
+
+【城市名称的识别】
+- 城市名称通常出现在句子的开头或结尾，如"北京今天天气"或"今天天气北京"
+- 也可能出现在句子中间，如"我想知道上海现在的天气"
+- 支持国内主要城市：北京、上海、广州、深圳、杭州、成都、武汉、西安、南京等
 
 使用规则：
-- 当用户询问"今天天气"、"现在天气"、"实时天气"时，使用 get_weather
-- 当用户询问"天气预报"、"未来几天天气"、"这周天气"时，使用 get_weather_forecast
-- 如果用户没有明确说明城市，请主动询问用户所在城市
-- 收到天气数据后，用简洁清晰的中文总结给用户，可以适当添加使用建议（如是否需要带伞、增减衣物等）
-""")
+1. 分析用户问题，识别是否包含城市名称
+2. 如果用户没有明确说明城市，请主动询问用户所在城市
+3. 根据用户意图选择合适的工具：
+   - 询问当前状况（今天、现在、当前）→ 使用 get_weather
+   - 询问未来情况（预报、明天、未来、下周）→ 使用 get_weather_forecast
+4. 收到天气数据后，用简洁清晰的语言总结给用户，可以适当添加使用建议（如是否需要带伞、增减衣物等）
+5. 回复语言应与用户提问语言保持一致（中文提问用中文回复，英文提问用英文回复）
+"""
 
+# 创建工具调用的 prompt，包含聊天历史支持
+prompt = ChatPromptTemplate.from_messages([
+    ("system", system_prompt),
+    MessagesPlaceholder(variable_name="chat_history", optional=True),
+    ("user", "{input}"),
+    ("assistant", "{agent_scratchpad}"),
+])
 
-agent = create_agent(
-    model=llm,
+agent = create_tool_calling_agent(
+    llm=llm,
     tools=tools,
-    system_prompt=system_prompt,
+    prompt=prompt,
+)
+
+agent_executor = AgentExecutor(
+    agent=agent,
+    tools=tools,
+    verbose=False,
 )
 
 
@@ -183,11 +221,13 @@ def main():
         try:
             # 调用 Agent 处理用户输入
             # agent.invoke 接收一个包含 messages 的字典，消息格式为 LangChain 标准格式
-            result = agent.invoke({
-                "messages": [{"role": "user", "content": user_input}]
+            result = agent_executor.invoke({
+                "input": user_input
             })
-            # 从返回结果中提取最后一条 AI 的回复内容
-            answer = result["messages"][-1].content
+            # 从返回结果中提取 AI 的回复内容
+            answer = result["output"]
+            # 处理编码问题
+            answer = answer.encode('utf-8', 'replace').decode('utf-8')
             print(f"🤖 助手:\n{answer}\n")
         except Exception as e:
             print(f"❌ 出错了: {e}\n")
